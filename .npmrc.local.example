@@ -1,0 +1,3 @@
+@infragistics:registry=https://packages.infragistics.com/npm/js-licensed/
+//packages.infragistics.com/npm/js-licensed/:_auth=<your-base64-auth-token>
+//packages.infragistics.com/npm/js-licensed/:username=<your-licensed-npm-username>
