@@ -1,114 +1,100 @@
-# IgrGrid header-template regression in 19.9.0 (works correctly in 19.4.0)
+# IgrGrid 19.9.0: "Maximum update depth exceeded" with header icon templates
 
 ## Summary
 
-Upgrading `@infragistics/igniteui-react` and `@infragistics/igniteui-react-grids`
-from `19.4.0` to `19.9.0` breaks any `IgrGrid` that uses a header-icon-style
-template prop — confirmed with `sortHeaderIconTemplate` and
-`excelStyleHeaderIconTemplate`, but the defect is in shared code used by any
-template whose context object exposes `implicit` (several other grid template
-props share this same context shape).
+With `@infragistics/igniteui-react-grids` **19.9.0**, an `IgrGrid` that has a
+header icon template (`sortHeaderIconTemplate` or
+`excelStyleHeaderIconTemplate`) **and** any template prop explicitly passed as
+`undefined` (for example `rowEditTextTemplate={isEditable ? Tpl : undefined}`)
+hangs on mount. React throws `Maximum update depth exceeded`, logged by
+Angular's error handler as `ERROR Error: Maximum update depth exceeded ...`.
 
-**Symptom in a real application:** enabling either prop causes the grid to
-spiral into a React `Maximum update depth exceeded` crash — the tab becomes
-unresponsive. Disabling both props makes it stable again.
+The same code works on 19.4.0.
 
-**Root cause:** both `@infragistics/igniteui-react` and
-`@infragistics/igniteui-react-grids` 19.9.0 ship their own copy of a template
-rendering bridge (`react-props-DvdRCtwq.js`) that determines whether a
-template callback should be re-invoked. In 19.4.0 this did a deep-equality
-check and skipped the callback when nothing had changed. In 19.9.0 that check
-was removed — the method now unconditionally returns `true`, so the callback
-re-fires on every internal grid update tick regardless of whether the
-column's content actually changed.
+## Reproduce
 
-## The diff
-
-**19.4.0** — `@infragistics/igniteui-react-grids/template-renderer.js`
-(and the matching file in `@infragistics/igniteui-react`):
-
-```js
-_shouldUpdateNG(t) {
-  return d(t.$implicit, this._state.previous)
-    ? !1
-    : (this._state.previous = t.$implicit, !0);
-}
+```bash
+cp .npmrc.local.example .npmrc.local   # add your Infragistics licensed-feed credentials
+npm_config_userconfig="$(pwd)/.npmrc.local" npm install
+npm_config_userconfig="$(pwd)/.npmrc.local" npm run dev
 ```
 
-(`d` is the module's deep-equal helper — this skips re-invoking the callback
-when `$implicit` hasn't changed.)
+Open the printed URL with DevTools open. The page links to three variants:
 
-**19.9.0** — `@infragistics/igniteui-react-grids/react-props-DvdRCtwq.js`
-(byte-identical copy also present in `@infragistics/igniteui-react`):
+| URL | Header icon templates | `rowEditTextTemplate` | Result |
+| --- | --- | --- | --- |
+| `/` | on | passed as `undefined` | hangs, `Maximum update depth exceeded` |
+| `/?undefinedProp=omit` | on | key omitted | works |
+| `/?headerTemplates=off` | off | passed as `undefined` | works |
+
+All of the code is in `src/App.tsx` (about 70 lines).
+
+## Root cause
+
+The loop is a single synchronous call chain (captured stack, trimmed):
+
+```
+dispatchSetState                       (react-dom)
+renderFunc                             react-props-DvdRCtwq.js   setRenderers(new Map(...))
+RequestRenderer.update                 react-props-DvdRCtwq.js   _shouldUpdate() -> _shouldUpdateNG() === true
+litRender                              igniteui-webcomponents-grids  header icon template view
+ApplicationRef tick / synchronize      igniteui-webcomponents-grids  zone exit -> change detection
+Eb.setInputValue                       igniteui-webcomponents-grids  input considered changed
+set rowEditTextTemplate                igniteui-webcomponents-grids
+setProperty                            @lit/react create-component   useLayoutEffect re-assigns every prop
+commitLayoutEffects                    (react-dom)               setState above is SyncLane -> nested
+```
+
+Two things combine:
+
+1. **An `undefined` template prop gets a new function on every render.** In
+   `react-props-DvdRCtwq.js`, `createComponent$1` deletes the cached listener
+   for any prop whose value is `undefined` (`hasNestedProperty` returns false),
+   but `processProps` still iterates that key and creates a fresh
+   `createPatched(...)` wrapper. `@lit/react` then assigns it to the element in
+   its layout effect. `Eb.setInputValue` sees a function it has never seen,
+   wraps it in a new `TemplateRef`, sets the input, and the zone exit runs
+   change detection synchronously, still inside React's commit.
+2. **`_shouldUpdateNG` no longer de-duplicates.** Change detection re-runs the
+   header icon template views, whose `RequestRenderer.update` now always invokes
+   the callback, which calls `setRenderers(...)`. Because this happens during
+   React's commit phase it gets a sync lane, so React re-renders the wrapper
+   immediately, the layout effect re-assigns the `undefined` template prop
+   (new function again), and the cycle repeats until React aborts.
+
+In 19.4.0 step 2 compared `ctx.$implicit` and skipped the callback when it was
+unchanged, which broke the cycle:
 
 ```js
+// 19.4.0 template-renderer.js
+_shouldUpdateNG(t) {
+  return d(t.$implicit, this._state.previous) ? !1 : (this._state.previous = t.$implicit, !0);
+}
+
+// 19.9.0 react-props-DvdRCtwq.js
 _shouldUpdateNG(_data) {
   return true;
 }
 ```
 
-The equality check was dropped entirely. `_shouldUpdate()` still contains a
-proper equality-gated branch for the *other* (non-`implicit`) context shape a
-few lines below it — only the `implicit`-context path (used by header icon
-templates, among others) regressed:
+Either fix on your side would stop it: restore the equality check in
+`_shouldUpdateNG`, and/or keep the cached listener (or skip the prop) when a
+template prop's value is `undefined`.
 
-```js
-_shouldUpdate() {
-  const data = this._state.current;
-  if (Reflect.has(data, "implicit")) return this._shouldUpdateNG(data); // always true now
-  if (equal(this._state.previous, data)) return false; // this branch is still correct
-  this._state.previous = data;
-  return true;
-}
+## Workaround
+
+Never pass a template prop as `undefined`; omit the key instead:
+
+```tsx
+<IgrGrid
+  {...(isEditable && { rowEditTextTemplate, rowEditActionsTemplate })}
+  sortHeaderIconTemplate={SortIcon}
+/>
 ```
-
-## Reproduction
-
-```bash
-cp .npmrc.local.example .npmrc.local   # fill in your own Infragistics licensed-feed credentials
-npm_config_userconfig="$(pwd)/.npmrc.local" npm install
-npm_config_userconfig="$(pwd)/.npmrc.local" npm run dev
-```
-
-Open the printed `localhost` URL. Within a couple of seconds you'll see two
-counters on the page — "`sortHeaderIconTemplate` invocations" and
-"`excelStyleHeaderIconTemplate` invocations" — climbing into the thousands,
-even though nothing about the grid's data, sorting, filtering, or column
-widths is changing. That is the defect, deterministically, with no timing
-dependence.
-
-In our production application (a much larger grid — dozens of columns, plus
-an app-level polling/layout-diff hook that legitimately touches grid state
-every ~1.2s) this same unconditional re-invocation compounds into a full
-`Maximum update depth exceeded` crash within a few seconds of opening the
-view. This minimal shell is deliberately small and doesn't carry that app's
-polling hook, so it reliably demonstrates the over-invocation but isn't
-guaranteed to tip into the full crash on its own — the "Run 200 rapid sorts"
-button on the page is one attempt at forcing it synchronously via the grid's
-`sort()` API; it may or may not trip the crash depending on your machine/React
-version, but the invocation counters above prove the bug independently of
-that.
-
-## Expected vs. actual
-
-- **Expected (19.4.0 behavior):** the counters stabilize shortly after mount
-  and only increase when a column's actual header content changes (sort
-  direction, filter state, etc.).
-- **Actual (19.9.0):** the counters climb continuously and unboundedly for as
-  long as the page is open, for every column using either template prop.
 
 ## Environment
 
-- `@infragistics/igniteui-react`: `19.9.0`
-- `@infragistics/igniteui-react-grids`: `19.9.0`
-- `react` / `react-dom`: `18.3.1`
-- Reproduced in Chrome (latest) via Vite 5 dev server; not browser-specific.
-
-## Workaround we're using in the meantime
-
-We've applied a local `pnpm patch` to `@infragistics/igniteui-react-grids`
-that restores the 19.4.0 equality check (and adds a defensive null-check
-around the `createPortal` call a few lines below it, since the `WeakRef`-held
-render target can legitimately be garbage-collected between scheduling and
-invocation — a secondary, smaller robustness fix). Happy to share that patch
-file if useful for a fix on your end.
+- `@infragistics/igniteui-react-grids` 19.9.0 (`@infragistics/igniteui-webcomponents-grids` 7.2.1)
+- `@infragistics/igniteui-react` 19.9.0, `@lit/react` 1.0.8
+- `react` / `react-dom` 18.3.1
+- Chrome, Vite dev server
